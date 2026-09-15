@@ -40,7 +40,7 @@ by hash. Mapping hashes to your app's files/messages is left to you.
 dependencies:
   i2p:
     git:
-      url: https://github.com/geograms/i2p-dart.git
+      url: https://github.com/x1watt/i2p-dart.git
 ```
 
 ## Quick start
