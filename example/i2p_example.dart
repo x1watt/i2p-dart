@@ -2,12 +2,16 @@
 // in-memory content store, announce a blob by its sha256 so the network can find
 // it, and print our reachable b32 address.
 //
-// Run with:  dart run example/i2p_example.dart
+// Run with:  dart run example/i2p_example.dart [state folder]
 //
-// Note: joining the live I2P network (netId 2) reseeds over HTTPS and builds
-// tunnels, which takes a little while on first start.
+// Note: the first start reseeds over HTTPS and builds tunnels, which takes a
+// little while. The node keeps its identity and the routers it saw in the
+// state folder (default ./i2p-state), so later starts have the same address
+// and skip the reseed. The identity file holds private keys: a real app
+// should encrypt it.
 
 import 'dart:convert';
+import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:crypto/crypto.dart';
@@ -30,11 +34,19 @@ class MemoryStore implements I2pContentStore {
   Future<void> put(Uint8List bytes, String ext) async => add(bytes);
 }
 
-Future<void> main() async {
+Future<void> main(List<String> args) async {
+  final state = Directory(args.isNotEmpty ? args.first : 'i2p-state')..createSync(recursive: true);
+  final idFile = File('${state.path}/identity.key');
+  final identity = (idFile.existsSync() ? I2pIdentity.fromBytes(idFile.readAsBytesSync()) : null) ??
+      I2pIdentity.generate();
+  idFile.writeAsBytesSync(identity.toBytes());
+
   final store = MemoryStore();
   final service = I2pService(
     store: store,
     log: (m) => print('[i2p] $m'),
+    identity: identity,
+    stateDir: state.path,
   );
 
   // Seed some content we are willing to serve.
@@ -50,7 +62,7 @@ Future<void> main() async {
   }
 
   print('Node is up.');
-  print('Our address: ${service.b32}.b32.i2p');
+  print('Our address: ${service.b32}');
 
   // Announce so other devices can discover this blob by hash, with no prior
   // knowledge of who holds it.

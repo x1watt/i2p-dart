@@ -42,9 +42,10 @@ class Destination {
   Destination._(this.encPriv, this.encPub, this.signPriv, this.signPub,
       this.keysAndCert, this.hash);
 
-  static Future<Destination> generate() async {
-    final enc = await I2pCrypto.x25519Generate();
-    final sign = await I2pCrypto.ed25519Generate();
+  /// A new destination, or the same one again from its two 32-byte seeds.
+  static Future<Destination> generate({Uint8List? encSeed, Uint8List? signSeed}) async {
+    final enc = await I2pCrypto.x25519Generate(encSeed);
+    final sign = await I2pCrypto.ed25519Generate(signSeed);
     final kc = buildKeysAndCert(enc.pub, sign.pub);
     return Destination._(
         enc.priv, enc.pub, sign.priv, sign.pub, kc, I2pCrypto.sha256(kc));
@@ -120,6 +121,76 @@ List<ParsedLease> parseLeaseSet2Leases(Uint8List ls) {
   } catch (_) {
     return [];
   }
+}
+
+/// A LeaseSet2 whose signature and destination were checked.
+class VerifiedLeaseSet {
+  final Uint8List destination; // KeysAndCert of the owner
+  final List<ParsedLease> leases;
+  final int publishedSeconds;
+  final int expiresSeconds;
+  VerifiedLeaseSet(this.destination, this.leases, this.publishedSeconds, this.expiresSeconds);
+}
+
+/// Parse a LeaseSet2 (starting at the Destination, as carried in a
+/// DatabaseStore) and accept it only when the destination hashes to
+/// [wantHash], the owner's Ed25519 signature is valid and it has not expired.
+/// Without this a floodfill could answer a lookup with somebody else's
+/// tunnels. Offline-signed lease sets are not accepted (i2p-dart never makes
+/// them).
+Future<VerifiedLeaseSet?> verifyLeaseSet2(Uint8List ls, Uint8List wantHash,
+    {int? nowSeconds}) async {
+  try {
+    // KeysAndCert: 256 + 128 + certificate (type, length, payload).
+    final certLen = (ls[385] << 8) | ls[386];
+    final destLen = 387 + certLen;
+    final dest = ls.sublist(0, destLen);
+    if (!_equal(I2pCrypto.sha256(dest), wantHash)) return null;
+    // Only Ed25519 signing keys (KeyCertificate type 5, sig type 7).
+    if (ls[384] != 5 || certLen < 4 || ((ls[387] << 8) | ls[388]) != 7) return null;
+    var o = destLen;
+    final published = (ls[o] << 24) | (ls[o + 1] << 16) | (ls[o + 2] << 8) | ls[o + 3];
+    final expires = (ls[o + 4] << 8) | ls[o + 5];
+    final flags = (ls[o + 6] << 8) | ls[o + 7];
+    if (flags & 1 != 0) return null; // offline keys
+    o += 8;
+    final propsLen = (ls[o] << 8) | ls[o + 1];
+    o += 2 + propsLen;
+    final numKeys = ls[o++];
+    for (var i = 0; i < numKeys; i++) {
+      final klen = (ls[o + 2] << 8) | ls[o + 3];
+      o += 4 + klen;
+    }
+    final numLeases = ls[o++];
+    final leases = <ParsedLease>[];
+    for (var i = 0; i < numLeases; i++) {
+      final gw = ls.sublist(o, o + 32);
+      final tid = (ls[o + 32] << 24) | (ls[o + 33] << 16) | (ls[o + 34] << 8) | ls[o + 35];
+      final end = (ls[o + 36] << 24) | (ls[o + 37] << 16) | (ls[o + 38] << 8) | ls[o + 39];
+      leases.add(ParsedLease(gw, tid, end));
+      o += 40;
+    }
+    if (ls.length < o + 64) return null;
+    final signed = Uint8List(1 + o)
+      ..[0] = leaseSetStoreType
+      ..setRange(1, 1 + o, ls);
+    final sig = ls.sublist(o, o + 64);
+    if (!await I2pCrypto.ed25519Verify(dest.sublist(352, 384), signed, sig)) return null;
+    final now = nowSeconds ?? DateTime.now().millisecondsSinceEpoch ~/ 1000;
+    if (published + expires < now) return null;
+    return VerifiedLeaseSet(dest, leases, published, expires);
+  } catch (_) {
+    return null;
+  }
+}
+
+bool _equal(List<int> a, List<int> b) {
+  if (a.length != b.length) return false;
+  var d = 0;
+  for (var i = 0; i < a.length; i++) {
+    d |= a[i] ^ b[i];
+  }
+  return d == 0;
 }
 
 Uint8List _be32(int v) =>

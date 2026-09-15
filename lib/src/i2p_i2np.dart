@@ -44,11 +44,23 @@ Uint8List buildLeaseSetLookup(Uint8List key, Uint8List fromHash) {
 /// first byte is the store type. Header: key(32) + storeType(1) + replyToken(4);
 /// with replyToken 0 the leaseset data (including its leading store-type byte)
 /// follows immediately. Matches i2pd's CreateDatabaseStoreMsg.
-Uint8List buildLeaseSetStore(Uint8List key, Uint8List leaseSet2, int storeType) {
+///
+/// A non-zero [replyToken] asks the floodfill to confirm with a
+/// DeliveryStatus to [replyGateway] (tunnel 0: straight to that router) and,
+/// in Java I2P and i2pd alike, to flood the store on to the other floodfills
+/// closest to the key. Without it the lease set stays on the floodfills we
+/// picked, and a node whose view of the network differs (a phone reseeded
+/// elsewhere) looks it up in the wrong place.
+Uint8List buildLeaseSetStore(Uint8List key, Uint8List leaseSet2, int storeType,
+    {int replyToken = 0, Uint8List? replyGateway}) {
   final b = BytesBuilder();
   b.add(key); // 32
   b.addByte(storeType); // type
-  b.add(Uint8List(4)); // reply token = 0
+  b.add([replyToken >> 24 & 0xff, replyToken >> 16 & 0xff, replyToken >> 8 & 0xff, replyToken & 0xff]);
+  if (replyToken != 0) {
+    b.add(Uint8List(4)); // reply tunnel 0: deliver to the gateway router itself
+    b.add(replyGateway ?? Uint8List(32));
+  }
   // The store-type byte is carried only in the header; the leaseset data begins
   // at the Destination. i2pd re-injects the store type at buf[-1] for signature
   // verification, so drop the leading store-type byte from our signed buffer.

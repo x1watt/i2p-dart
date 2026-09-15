@@ -23,7 +23,9 @@ import 'package:archive/archive.dart';
 import 'i2p_crypto.dart';
 import 'i2p_datagram.dart';
 import 'i2p_i2np.dart';
+import 'i2p_identity.dart';
 import 'i2p_leaseset.dart';
+import 'i2p_message.dart';
 import 'i2p_ntcp2.dart';
 import 'i2p_reseed.dart';
 import 'i2p_router.dart';
@@ -224,43 +226,108 @@ class I2pNode {
       final lo = all.where((r) => !_highBw(r)).toList()..shuffle(_rng);
       return [...hi, ...lo];
     }
-    final freshHi = fresh.where(_highBw).toList()..shuffle(_rng);
-    final freshLo = fresh.where((r) => !_highBw(r)).toList()..shuffle(_rng);
+    // Routers that worked for us before (this run or the cached one) first.
+    final worked = fresh.where((r) => _good.contains(_hex(r.identityHash))).toList()..shuffle(_rng);
+    final rest = fresh.where((r) => !_good.contains(_hex(r.identityHash)));
+    final freshHi = rest.where(_highBw).toList()..shuffle(_rng);
+    final freshLo = rest.where((r) => !_highBw(r)).toList()..shuffle(_rng);
     final bad = _dialable
         .where((r) => _demoted.contains(_hex(r.identityHash)))
         .toList()
       ..shuffle(_rng);
-    return [...freshHi, ...freshLo, ...bad];
+    return [...worked, ...freshHi, ...freshLo, ...bad];
   }
 
+  /// Routers we completed a handshake with (identity hash hex).
+  final _good = <String>{};
+  void _worked(RouterInfo ri) => _good.add(_hex(ri.identityHash));
+
+  /// Fewer usable cached routers than this and [start] reseeds right away.
+  static const minCachedRouters = 50;
+
+  /// Start the node. [identity] keeps the same destination (address) and
+  /// router as a previous run; without it both are new. [peers] replaces the
+  /// reseed download; with [cached] set they come from our own cache, so
+  /// [goodPeers] are tried first and the node falls back to a reseed when
+  /// the cache is too small or no gateway comes up from it.
   Future<bool> start({
     List<RouterInfo>? peers,
+    I2pIdentity? identity,
+    bool cached = false,
+    Set<String> goodPeers = const {},
     String? hostOverride,
     int? portOverride,
     Uint8List? ivOverride,
     int hops = 1,
   }) async {
     this.hops = hops;
-    router = await OurRouter.generate(netId: netId);
-    dest = await Destination.generate();
+    router = await OurRouter.generate(
+        netId: netId, staticSeed: identity?.routerStatic, signSeed: identity?.routerSign);
+    dest = await Destination.generate(encSeed: identity?.destEnc, signSeed: identity?.destSign);
     _dialHost = hostOverride;
     _dialPort = portOverride;
     _dialIv = ivOverride;
-    log?.call('node: dest $b32');
+    log?.call('node: dest $b32${identity != null ? " (saved identity)" : ""}');
 
-    _peers.addAll(peers ?? await reseedRouters(log: log));
-    _dialable.addAll(_peers.where((ri) {
-      final a = ri.ntcp2;
-      return ri.isEcies &&
-          a != null &&
-          (hostOverride != null || (a.host != null && a.port != null)) &&
-          a.staticKey?.length == 32 &&
-          (ivOverride != null || a.iv?.length == 16);
-    }));
-    _floodfills.addAll(
-        _dialable.where((ri) => (ri.options['caps'] ?? '').contains('f')));
+    _good.addAll(goodPeers);
+    var reseeded = false;
+    if (peers != null) _addPeers(peers);
+    if (peers == null || (cached && _dialable.length < minCachedRouters)) {
+      _addPeers(await reseedRouters(log: log));
+      reseeded = true;
+    } else if (cached) {
+      log?.call('node: ${_dialable.length} routers from cache, no reseed');
+    }
     log?.call('node: ${_dialable.length} dialable ECIES, ${_floodfills.length} floodfill');
+    if (await _bringUp()) return true;
+    if (!cached || reseeded) return false;
+    log?.call('node: no gateway from the cached routers, reseeding');
+    _addPeers(await reseedRouters(log: log));
     return _bringUp();
+  }
+
+  void _addPeers(List<RouterInfo> peers) {
+    final known = {for (final r in _peers) _hex(r.identityHash)};
+    for (final ri in peers) {
+      if (!known.add(_hex(ri.identityHash))) continue;
+      _peers.add(ri);
+      final a = ri.ntcp2;
+      final dialable = ri.isEcies &&
+          a != null &&
+          (_dialHost != null || (a.host != null && a.port != null)) &&
+          a.staticKey?.length == 32 &&
+          (_dialIv != null || a.iv?.length == 16);
+      if (!dialable) continue;
+      _dialable.add(ri);
+      if ((ri.options['caps'] ?? '').contains('f')) _floodfills.add(ri);
+    }
+  }
+
+  /// Routers worth saving for the next start, best first: those we completed
+  /// a handshake with, then floodfills, then other fresh high-bandwidth
+  /// routers. Entries are (raw RouterInfo, worked).
+  List<(Uint8List, bool)> routerCacheEntries({int max = 300}) {
+    final out = <(Uint8List, bool)>[];
+    final seen = <String>{};
+    void add(RouterInfo ri, bool good) {
+      final raw = ri.raw;
+      if (raw == null || out.length >= max || !seen.add(_hex(ri.identityHash))) return;
+      out.add((raw, good));
+    }
+
+    for (final ri in _dialable) {
+      if (_good.contains(_hex(ri.identityHash))) add(ri, true);
+    }
+    for (final ri in _floodfills) {
+      if (!_demoted.contains(_hex(ri.identityHash))) add(ri, false);
+    }
+    for (final ri in _dialable) {
+      if (_highBw(ri) && !_demoted.contains(_hex(ri.identityHash))) add(ri, false);
+    }
+    for (final ri in _dialable) {
+      if (!_demoted.contains(_hex(ri.identityHash))) add(ri, false);
+    }
+    return out;
   }
 
   /// Build inbound tunnels, publish, and start serving + keepalive. Re-runnable
@@ -361,6 +428,8 @@ class I2pNode {
     _running = false; // stops keepalive + serve loops
     _kaTimer?.cancel();
     _natTimer?.cancel();
+    _repairTimer?.cancel();
+    _repairTimer = null;
     for (final g in _gws) {
       g.session.close();
     }
@@ -559,6 +628,7 @@ class I2pNode {
         s.close();
         return null;
       }
+      _worked(gw);
       return _Gw(s, gw, inTun, TunnelLayer(keys.layerKey, keys.ivKey));
     } catch (e) {
       s?.close();
@@ -626,6 +696,7 @@ class I2pNode {
         s.close();
         return null;
       }
+      _worked(obep);
       return _Ob(s, obep, outTun, TunnelLayer(keys.layerKey, keys.ivKey));
     } catch (e) {
       s?.close();
@@ -740,24 +811,61 @@ class I2pNode {
     return list.take(n).toList();
   }
 
+  /// Publishes our LeaseSet2 and one for every shared destination, all in
+  /// parallel.
   Future<void> _publish() async {
+    await Future.wait([
+      _storeLeaseSet(dest, 8),
+      for (final d in _shared.values) _storeShared(d),
+    ]);
+  }
+
+  /// Leases we published, as `gateway:tunnel`, so a merged shared lease set
+  /// never carries our own expired tunnels as if they were someone else's.
+  final _ownLeases = <String>{};
+
+  /// Stores [d]'s LeaseSet2, pointing at our gateways (and at [others], the
+  /// leases of other nodes answering for a shared destination), on the [n]
+  /// closest floodfills.
+  Future<void> _storeLeaseSet(Destination d, int n,
+      {String label = 'LeaseSet2', List<Lease2> others = const []}) async {
     final end = DateTime.now().millisecondsSinceEpoch ~/ 1000 + 600;
     final leases = [
       for (final g in _gws) Lease2(g.gateway.identityHash, g.gatewayTunnel, end)
     ];
-    final ls = await dest.buildLeaseSet2(leases);
-    final store = buildLeaseSetStore(dest.hash, ls, leaseSetStoreType);
+    if (leases.isEmpty) return;
+    for (final l in leases) {
+      _ownLeases.add('${_hex(l.gatewayHash)}:${l.tunnelId}');
+    }
+    if (_ownLeases.length > 256) _ownLeases.remove(_ownLeases.first);
+    leases.addAll(others.take(16 - leases.length));
+    final ls = await d.buildLeaseSet2(leases);
     // Store to several closest floodfills so an independently-reseeded peer
     // (e.g. the phone on another network) converges on at least one of them.
     // In PARALLEL: 8 sequential dials (each up to ~15 s) could otherwise stall
     // the keepalive loop and let our leases expire.
-    final targets = _closestFloodfills(_routingKey(dest.hash), 8);
+    final targets = _closestFloodfills(_routingKey(d.hash), n);
+    var acked = 0;
     final results = await Future.wait(targets.map((ff) async {
       try {
         final s = await _dial(ff, ephemeral: true);
         await s.handshake().timeout(const Duration(seconds: 15));
-        await s.sendI2np(I2npType.databaseStore, store);
-        await Future.delayed(const Duration(milliseconds: 400));
+        _worked(ff);
+        // A reply token makes the floodfill flood the store to its peers
+        // closest to the key; its DeliveryStatus comes back on this session.
+        final token = 1 + _rng.nextInt(0x7ffffffe);
+        await s.sendI2np(I2npType.databaseStore,
+            buildLeaseSetStore(d.hash, ls, leaseSetStoreType, replyToken: token, replyGateway: s.us.identityHash));
+        final end = DateTime.now().add(const Duration(seconds: 4));
+        while (DateTime.now().isBefore(end)) {
+          final r = await s.nextI2np(end.difference(DateTime.now()));
+          if (r == null) break;
+          if (r.$1 == 10 && r.$2.length >= 4 &&
+              (r.$2[0] << 24 | r.$2[1] << 16 | r.$2[2] << 8 | r.$2[3]) == token) {
+            acked++;
+            break;
+          }
+        }
         s.close();
         return true;
       } catch (_) {
@@ -765,8 +873,58 @@ class I2pNode {
       }
     }));
     final stored = results.where((ok) => ok).length;
-    log?.call('node: published LeaseSet2 to $stored/${targets.length} floodfills');
+    log?.call('node: published $label to $stored/${targets.length} floodfills ($acked confirmed)'
+        '${others.isEmpty ? '' : ' with ${others.length} lease(s) of others'}');
   }
+
+  /// Publishes a shared destination with the leases of the other nodes
+  /// answering for it merged in. A floodfill keeps one lease set per
+  /// destination (the newest), so without the merge the last node to publish
+  /// would hide the others, and a node would reach only itself there. With
+  /// it, a lookup returns the gateways of every node that published within
+  /// the last ten minutes (lease ends), and a message goes to all of them.
+  /// Concurrent publishers converge at the next republish.
+  Future<void> _storeShared(Destination d) async {
+    final label = 'shared ${i2pBase32(d.hash).substring(0, 8)}';
+    var seen = <ParsedLease>[];
+    try {
+      seen = await lookupLeases(d.hash).timeout(const Duration(seconds: 20));
+    } catch (_) {}
+    final now = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+    final keys = <String>{};
+    final others = [
+      for (final l in seen..sort((a, b) => b.endSeconds.compareTo(a.endSeconds)))
+        if (l.endSeconds > now + 30 &&
+            !_ownLeases.contains('${_hex(l.gatewayHash)}:${l.tunnelId}') &&
+            keys.add('${_hex(l.gatewayHash)}:${l.tunnelId}'))
+          Lease2(l.gatewayHash, l.tunnelId, l.endSeconds),
+    ];
+    await _storeLeaseSet(d, 4, label: label, others: others.take(12).toList());
+  }
+
+  // ---- shared destinations ----
+
+  /// Destinations whose keys other nodes hold too (for example one derived
+  /// from a room's name): this node publishes a LeaseSet2 for each pointing
+  /// at its own gateways and accepts application messages addressed to
+  /// them, so whoever looks one up reaches some node that answers for it.
+  final _shared = <String, Destination>{};
+
+  /// Answer for the destination made from these two 32-byte seeds too.
+  /// Returns its address.
+  Future<String> addSharedDestination(Uint8List encSeed, Uint8List signSeed) async {
+    final d = await Destination.generate(encSeed: encSeed, signSeed: signSeed);
+    final k = _hex(d.hash);
+    if (_shared.containsKey(k)) return '${i2pBase32(d.hash)}.b32.i2p';
+    _shared[k] = d;
+    log?.call('node: answering for shared ${i2pBase32(d.hash).substring(0, 8)}');
+    if (isUp) unawaited(_storeShared(d));
+    return '${i2pBase32(d.hash)}.b32.i2p';
+  }
+
+  /// Stop answering for a shared destination (its LeaseSet2 expires within
+  /// ten minutes).
+  void removeSharedDestination(Uint8List hash) => _shared.remove(_hex(hash));
 
   Future<ParsedLease?> lookupLease(Uint8List targetDestHash) async {
     final all = await lookupLeases(targetDestHash);
@@ -778,18 +936,70 @@ class I2pNode {
   /// answer — a diverse reseed pool has dead/slow floodfills, and querying them
   /// sequentially (up to 8 x 12 s) used to stall every delivery and time out the
   /// whole fetch. Racing them makes a lookup as fast as the quickest responder.
+  ///
+  /// Only lease sets signed by the destination itself count: a floodfill
+  /// answering with a forged or stale one is ignored like a miss. A good
+  /// answer also refreshes the lease cache.
   Future<List<ParsedLease>> lookupLeases(Uint8List targetDestHash) async {
-    final targets = _closestFloodfills(_routingKey(targetDestHash), 8);
+    final key = _routingKey(targetDestHash);
+    final wantKey = _hex(targetDestHash);
+    final asked = <String>{};
+    var next = _closestFloodfills(key, 8);
+    // Iterative, as I2P routers search: the floodfills closest to the key in
+    // OUR view may not be the closest in the network's (a phone knows a few
+    // hundred routers), and those that do not hold it name closer ones in
+    // their DatabaseSearchReply. Up to three rounds.
+    for (var round = 0; round < 3 && next.isNotEmpty; round++) {
+      for (final ff in next) {
+        asked.add(_hex(ff.identityHash));
+      }
+      final closer = <String, Uint8List>{};
+      final found = await _askLeases(next, targetDestHash, closer);
+      if (found.isNotEmpty) {
+        if (round > 0) log?.call('node: lookup ${wantKey.substring(0, 12)} found in round ${round + 1}');
+        return found;
+      }
+      int dist(Uint8List h) {
+        for (var i = 0; i < 32; i++) {
+          final d = h[i] ^ key[i];
+          if (d != 0) return i * 256 + (255 - d);
+        }
+        return 1 << 20;
+      }
+
+      final cand = [for (final e in closer.entries) if (!asked.contains(e.key)) e.value]
+        ..sort((a, b) => dist(b).compareTo(dist(a)));
+      final ris = await Future.wait(cand.take(4).map((h) => _resolveRouter(h)
+          .timeout(const Duration(seconds: 12))
+          .then<RouterInfo?>((r) => r, onError: (_) => null)));
+      next = [for (final ri in ris) if (ri != null && (ri.options['caps'] ?? '').contains('f')) ri];
+      // Remember them: they are closer to keys than what our reseed gave us,
+      // for later lookups and for our own stores.
+      for (final ri in next) {
+        if (!_floodfills.any((f) => _hex(f.identityHash) == _hex(ri.identityHash))) _floodfills.add(ri);
+      }
+      if (next.isNotEmpty) {
+        log?.call('node: lookup ${wantKey.substring(0, 12)}: asking ${next.length} closer floodfill(s)');
+      }
+    }
+    return [];
+  }
+
+  /// Asks [targets] concurrently for [targetDestHash]'s lease set: the first
+  /// verified answer wins. The peers named in search replies go to [closer].
+  Future<List<ParsedLease>> _askLeases(
+      List<RouterInfo> targets, Uint8List targetDestHash, Map<String, Uint8List> closer) {
     final wantKey = _hex(targetDestHash);
     final done = Completer<List<ParsedLease>>();
     var pending = targets.length;
-    if (pending == 0) return [];
+    if (pending == 0) return Future.value([]);
     for (final ff in targets) {
       () async {
         Ntcp2Session? s;
         try {
           s = await _dial(ff, ephemeral: true);
           await s.handshake().timeout(const Duration(seconds: 8));
+          _worked(ff);
           // Reply comes back over THIS ephemeral session, so the lookup's "from"
           // is this session's own identity (not our stable identity, which would
           // route the reply to our gateway session instead).
@@ -801,12 +1011,27 @@ class I2pNode {
             if (r.$1 == I2npType.databaseStore &&
                 _hex(r.$2.sublist(0, 32)) == wantKey &&
                 r.$2[32] == leaseSetStoreType) {
-              final leases = parseLeaseSet2Leases(r.$2.sublist(37));
-              if (leases.isNotEmpty && !done.isCompleted) done.complete(leases);
+              final ls = await verifyLeaseSet2(_storeData(r.$2), targetDestHash);
+              if (ls == null) {
+                log?.call('node: rejected a lease set for ${wantKey.substring(0, 12)} '
+                    'from ${_hex(ff.identityHash).substring(0, 12)} (bad signature, hash or expired)');
+                break;
+              }
+              if (ls.leases.isNotEmpty && !done.isCompleted) {
+                _leaseCache[wantKey] = (ls.leases, _leaseExpiryMs(ls.leases));
+                done.complete(ls.leases);
+              }
               break;
             } else if (r.$1 == I2npType.databaseSearchReply &&
                 _hex(r.$2.sublist(0, 32)) == wantKey) {
-              break; // not here
+              // key(32) count(1) count x peer(32) from(32): not here, try these.
+              final b = r.$2;
+              final n = b.length > 32 ? b[32] : 0;
+              for (var j = 0; j < n && 33 + (j + 1) * 32 <= b.length; j++) {
+                final h = Uint8List.fromList(b.sublist(33 + j * 32, 33 + (j + 1) * 32));
+                closer[_hex(h)] = h;
+              }
+              break;
             }
           }
         } catch (_) {
@@ -821,6 +1046,23 @@ class I2pNode {
     return done.future;
   }
 
+  /// The stored data of a DatabaseStore body: key(32) type(1) replyToken(4),
+  /// then a reply tunnel(4) and gateway(32) when the token is set.
+  static Uint8List _storeData(Uint8List body) {
+    final token = (body[33] << 24) | (body[34] << 16) | (body[35] << 8) | body[36];
+    return body.sublist(token == 0 ? 37 : 73);
+  }
+
+  /// Keep looked-up leases up to 5 minutes, never past the first lease's end.
+  static int _leaseExpiryMs(List<ParsedLease> leases) {
+    final now = DateTime.now().millisecondsSinceEpoch;
+    var until = now + 5 * 60 * 1000;
+    for (final l in leases) {
+      until = min(until, l.endSeconds * 1000);
+    }
+    return until;
+  }
+
   // ---- serving (inbound tunnel read loop, one per gateway) ----
 
   void _serveGw(_Gw gw) {
@@ -830,12 +1072,36 @@ class I2pNode {
         try {
           await gw.session.pumpI2np(
               const Duration(seconds: 30), (t, b) => _dispatch(t, b, gw));
-        } catch (_) {
+        } catch (e) {
+          // The session ended. pumpI2np used to return quietly here, and this
+          // loop then spun on the dead socket without ever yielding to the
+          // event loop: the whole isolate stopped (no timers, no messages).
+          if (_running && _gws.contains(gw)) {
+            log?.call('node: gateway ${_hex(gw.ri.identityHash).substring(0, 12)} lost: $e');
+          }
           break;
         }
       }
       gw.dead = true; // serve loop ended -> gateway no longer usable
+      _gatewayLost();
     }();
+  }
+
+  Timer? _repairTimer;
+
+  /// A gateway died: replace it and republish soon, rather than at the next
+  /// keepalive (up to 4 minutes of senders delivering into a dead lease).
+  void _gatewayLost() {
+    if (!_running || _repairTimer != null) return;
+    _repairTimer = Timer(const Duration(seconds: 3), () async {
+      try {
+        if (!_running) return;
+        await _guard('rotateGateways', _rotateGateways, const Duration(seconds: 50));
+        if (_running) await _guard('publish', _publish, const Duration(seconds: 40));
+      } finally {
+        _repairTimer = null;
+      }
+    });
   }
 
   void _dispatch(int type, Uint8List body, _Gw gw) {
@@ -855,6 +1121,11 @@ class I2pNode {
   /// Periodic NAT/connection keepalive (padding frames) on all live sessions —
   /// on by default; can be disabled for wired hosts or A/B testing.
   static bool natKeepAliveEnabled = true;
+
+  /// Also hand datagrams straight to the target's inbound gateway, next to
+  /// the outbound tunnel path (on by default; off to test the tunnel path
+  /// alone).
+  static bool directDelivery = true;
 
   Future<void> _handleTunnelData(Uint8List body, _Gw gw) async {
     try {
@@ -979,6 +1250,27 @@ class I2pNode {
               '#${r.$2} ${r.$3.length}b');
           _complete(_pieceWaiters, '${_hex(r.$1)}:${r.$2}', r.$3);
           break;
+        case opApp: // 'A' -> an application message, once
+          final f = parseApp(p);
+          if (f == null) return;
+          final to = _appGate.acceptTo([dest.hash, for (final d in _shared.values) d.hash], pd.srcHash, f);
+          // One line per application frame: rare next to tunnel traffic,
+          // and the first thing to look at when a message goes missing.
+          log?.call('node: app frame port ${f.port} for ${i2pBase32(f.toHash).substring(0, 8)} '
+              'from ${i2pBase32(pd.srcHash).substring(0, 8)}: ${to == null ? "refused" : "accepted"}');
+          if (to == null) return;
+          if (f.replyLeases.isNotEmpty) {
+            // Answer the sender through the tunnels it named, no lookup. Our
+            // own leases last ten minutes from publishing; keep theirs four.
+            final end = DateTime.now().millisecondsSinceEpoch ~/ 1000 + 600;
+            _leaseCache[_hex(pd.srcHash)] = (
+              [for (final l in f.replyLeases) ParsedLease(l.gatewayHash, l.tunnelId, end)],
+              DateTime.now().millisecondsSinceEpoch + 4 * 60 * 1000,
+            );
+          }
+          _messages.add(I2pMessage(pd.srcHash, f.port, f.payload,
+              DateTime.fromMillisecondsSinceEpoch(f.timeSeconds * 1000), to: to));
+          break;
       }
     } catch (e) {
       log?.call('node: tunnel-data error: $e');
@@ -1006,7 +1298,9 @@ class I2pNode {
         body[2] = (ob.tunnelId >> 8) & 0xff;
         body[3] = ob.tunnelId & 0xff;
         body.setRange(4, 4 + 1024, wire);
-        await ob.session.sendI2np(18, body); // TunnelData
+        // Bounded: a session whose socket stops draining would otherwise hold
+        // this (and every later frame queued behind it) forever.
+        await ob.session.sendI2np(18, body).timeout(_sendTimeout); // TunnelData
       }
       log?.call('node: sent ${cells.length} cell(s) via OB to '
           '${_hex(gatewayHash).substring(0, 12)}/$tunnelId');
@@ -1017,6 +1311,9 @@ class I2pNode {
     }
   }
 
+  /// Longest a single frame may take to leave on a session.
+  static const _sendTimeout = Duration(seconds: 15);
+
   /// Deliver a datagram into [tunnelId] at gateway [gatewayHash]. I2P delivery is
   /// best-effort and our requests are idempotent (a duplicate GET just gets
   /// answered twice; the fetch completer fires once), so we fire BOTH the proper
@@ -1026,7 +1323,7 @@ class I2pNode {
   Future<bool> _deliver(Uint8List gatewayHash, int tunnelId, Uint8List datagram) async {
     final msg = buildStandardI2np(i2npData, randomMsgId(), wrapDataBody(datagram));
     final viaOb = await _sendViaOutbound(gatewayHash, tunnelId, msg);
-    final viaDirect = await _injectDirect(gatewayHash, tunnelId, msg);
+    final viaDirect = directDelivery && await _injectDirect(gatewayHash, tunnelId, msg);
     return viaOb || viaDirect;
   }
 
@@ -1041,7 +1338,7 @@ class I2pNode {
     for (final g in _gws) {
       if (k == _hex(g.ri.identityHash)) {
         try {
-          await g.session.sendI2np(19, tg);
+          await g.session.sendI2np(19, tg).timeout(_sendTimeout);
           return true;
         } catch (_) {}
       }
@@ -1049,7 +1346,7 @@ class I2pNode {
     final existing = _txSessions[k];
     if (existing != null) {
       try {
-        await existing.sendI2np(19, tg);
+        await existing.sendI2np(19, tg).timeout(_sendTimeout);
         return true;
       } catch (_) {
         try {
@@ -1067,8 +1364,9 @@ class I2pNode {
     try {
       s = await _dial(ri, ephemeral: true);
       await s.handshake().timeout(const Duration(seconds: 8));
+      _worked(ri);
       _txSessions[k] = s;
-      await s.sendI2np(19, tg);
+      await s.sendI2np(19, tg).timeout(_sendTimeout);
       log?.call('node: deliver: injected to gw ${k.substring(0, 12)}');
       return true;
     } catch (e) {
@@ -1114,6 +1412,7 @@ class I2pNode {
         try {
           s = await _dial(ff, ephemeral: true);
           await s.handshake().timeout(const Duration(seconds: 8));
+          _worked(ff);
           await s.sendI2np(I2npType.databaseLookup,
               buildDatabaseLookup(routerHash, s.us.identityHash));
           for (var i = 0; i < 4; i++) {
@@ -1174,6 +1473,37 @@ class I2pNode {
       }
     }
     return null;
+  }
+
+  // ---- application messages ----
+
+  final _appGate = AppGate();
+  final _messages = StreamController<I2pMessage>.broadcast();
+
+  /// Application messages from other destinations, each delivered once.
+  Stream<I2pMessage> get messages => _messages.stream;
+
+  /// Send [payload] (up to [appMaxPayload] bytes) to the destination
+  /// [destHash] on [port]. Best effort, like a UDP datagram: true when at
+  /// least one of its gateways took it. The frame goes to every gateway of
+  /// the destination over two paths; the receiver keeps one copy.
+  Future<bool> sendMessage(Uint8List destHash, int port, Uint8List payload) async {
+    if (!isUp) return false;
+    final frame = buildApp(AppFrame(
+        port & 0xffff,
+        Uint8List.fromList(List.generate(8, (_) => _rng.nextInt(256))),
+        DateTime.now().millisecondsSinceEpoch ~/ 1000,
+        destHash,
+        payload,
+        replyLeases: _myLeases()));
+    // Who answers for a shared destination changes as nodes come and go:
+    // look it up afresh rather than trust a cached set.
+    if (_shared.containsKey(_hex(destHash))) _leaseCache.remove(_hex(destHash));
+    final cached = _leaseCache[_hex(destHash)]?.$1.length;
+    final ok = await _sendToCachedDest(destHash, await buildDatagram(dest, frame));
+    log?.call('node: app send port $port to ${i2pBase32(destHash).substring(0, 8)} '
+        '(${payload.length}b, ${cached == null ? 'looked up' : '$cached cached lease(s)'}): ${ok ? 'handed to a gateway' : 'failed'}');
+    return ok;
   }
 
   // ---- content-routing API ----
@@ -1371,7 +1701,7 @@ class I2pNode {
       Uint8List gatewayHash, int tunnelId, Uint8List datagram) async {
     final msg = buildStandardI2np(i2npData, randomMsgId(), wrapDataBody(datagram));
     final viaOb = await _sendViaOutbound(gatewayHash, tunnelId, msg);
-    final viaDirect = await _injectDirect(gatewayHash, tunnelId, msg);
+    final viaDirect = directDelivery && await _injectDirect(gatewayHash, tunnelId, msg);
     return viaOb || viaDirect;
   }
 
@@ -1386,7 +1716,7 @@ class I2pNode {
         log?.call('node: send: no leases for ${k.substring(0, 12)}');
         return false;
       }
-      entry = (leases, now + 5 * 60 * 1000);
+      entry = (leases, _leaseExpiryMs(leases));
       _leaseCache[k] = entry;
     }
     var any = false;
@@ -1604,6 +1934,8 @@ class I2pNode {
     _running = false;
     _kaTimer?.cancel();
     _natTimer?.cancel();
+    _repairTimer?.cancel();
+    _repairTimer = null;
     for (final g in _gws) {
       g.session.close();
     }
@@ -1622,6 +1954,7 @@ class I2pNode {
       st.close();
     }
     _stores.clear();
+    _messages.close();
   }
 
   static Uint8List? gunzipRi(Uint8List storeBody) {

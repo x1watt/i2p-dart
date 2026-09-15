@@ -6,8 +6,9 @@
  * The main isolate keeps the MediaArchive (sqlite) and the UI; the worker
  * isolate owns the node and its sockets. They talk over SendPorts:
  *   main -> worker: start, fetch, discoverFetch, announce, setRoster, provide,
- *                   pause, resume, stop  (each with a request id)
- *   worker -> main: 'ready' (b32), 'log', 'result' (id+data), and 'getReq'
+ *                   send, pause, resume, stop  (each with a request id)
+ *   worker -> main: 'ready' (b32), 'log', 'result' (id+data), 'msg' (an
+ *                   application message), and 'getReq'
  *                   (the node asks the main isolate to serve bytes for a sha256;
  *                   the main isolate answers from the archive).
  */
@@ -15,7 +16,10 @@ import 'dart:async';
 import 'dart:isolate';
 import 'dart:typed_data';
 
+import 'i2p_identity.dart';
+import 'i2p_message.dart';
 import 'i2p_node.dart';
+import 'i2p_router_cache.dart';
 import 'i2p_structures.dart';
 
 class I2pWorkerConfig {
@@ -26,13 +30,26 @@ class I2pWorkerConfig {
   final int hops;
   /// Raw RouterInfo blobs to use instead of reseeding (testing / pinned peers).
   final List<Uint8List>? peersRaw;
+  /// [I2pIdentity.toBytes] of a previous run, to keep the same address.
+  final Uint8List? identity;
+  /// Folder for the node's own state (the netDB cache, `routers.bin`). With
+  /// it, a start uses the routers of earlier runs instead of a reseed.
+  final String? stateDir;
+  /// Log every I2NP message arriving on a gateway session (diagnostics).
+  final bool rxDiag;
+  /// See [I2pNode.directDelivery].
+  final bool directDelivery;
   const I2pWorkerConfig(
       {this.netId = 2,
       this.hostOverride,
       this.portOverride,
       this.ivOverride,
       this.hops = 1,
-      this.peersRaw});
+      this.peersRaw,
+      this.identity,
+      this.stateDir,
+      this.rxDiag = false,
+      this.directDelivery = true});
 
   Map<String, dynamic> toMap() => {
         'netId': netId,
@@ -41,6 +58,10 @@ class I2pWorkerConfig {
         'iv': ivOverride,
         'hops': hops,
         'peers': peersRaw,
+        'identity': identity,
+        'stateDir': stateDir,
+        'rxDiag': rxDiag,
+        'direct': directDelivery,
       };
 }
 
@@ -57,6 +78,10 @@ class I2pWorker {
   final _pending = <int, Completer<dynamic>>{};
   int _seq = 0;
   String? _b32;
+  final _messages = StreamController<I2pMessage>.broadcast();
+
+  /// Application messages arriving at our destination.
+  Stream<I2pMessage> get messages => _messages.stream;
 
   bool get isRunning => _iso != null;
   String? get b32 => _b32;
@@ -88,6 +113,11 @@ class I2pWorker {
         break;
       case 'log':
         log?.call(m['msg'] as String);
+        break;
+      case 'msg':
+        _messages.add(I2pMessage(m['from'] as Uint8List, m['port'] as int,
+            m['bytes'] as Uint8List, DateTime.fromMillisecondsSinceEpoch(m['ms'] as int),
+            to: m['to'] as Uint8List?));
         break;
       case 'result':
         final c = _pending.remove(m['id']);
@@ -129,6 +159,17 @@ class I2pWorker {
       await _call('swarmFetch', {'sha': sha256, 'seed': seed}) as Uint8List?;
 
   Future<void> announce(Uint8List sha256) => _call('announce', {'sha': sha256});
+
+  /// Answer for a shared destination too (see [I2pNode.addSharedDestination]);
+  /// returns its address.
+  Future<String?> addShared(Uint8List encSeed, Uint8List signSeed) async =>
+      await _call('addShared', {'enc': encSeed, 'sign': signSeed}) as String?;
+
+  Future<void> removeShared(Uint8List hash) => _call('removeShared', {'hash': hash});
+
+  /// Send an application message; true when a gateway of [destHash] took it.
+  Future<bool> send(Uint8List destHash, int port, Uint8List payload) async =>
+      await _call('send', {'dest': destHash, 'port': port, 'bytes': payload}) as bool? ?? false;
   Future<void> setRoster(List<Uint8List> hashes) =>
       _call('setRoster', {'roster': hashes});
   Future<void> pause() => _call('pause');
@@ -139,6 +180,11 @@ class I2pWorker {
     _iso?.kill(priority: Isolate.beforeNextEvent);
     _iso = null;
     _tx = null;
+    for (final c in _pending.values) {
+      if (!c.isCompleted) c.complete(null);
+    }
+    _pending.clear();
+    _messages.close();
   }
 }
 
@@ -151,12 +197,20 @@ void _isolateMain(SendPort main) {
   I2pNode? node;
   final getReqs = <int, Completer<Uint8List?>>{};
   var getSeq = 0;
+  String? stateDir;
+  Timer? saveTimer;
+  void saveRouters() {
+    final n = node, dir = stateDir;
+    if (n != null && dir != null) saveRouterCache(dir, n.routerCacheEntries());
+  }
 
   rx.listen((m) async {
     if (m is! Map) return;
     switch (m['cmd']) {
       case 'start':
         final cfg = m['config'] as Map;
+        I2pNode.rxDiag = cfg['rxDiag'] == true;
+        I2pNode.directDelivery = cfg['direct'] != false;
         node = I2pNode(
           netId: cfg['netId'] as int,
           log: (s) => main.send({'t': 'log', 'msg': s}),
@@ -170,19 +224,57 @@ void _isolateMain(SendPort main) {
                 .timeout(const Duration(seconds: 10), onTimeout: () => null);
           },
         );
+        node!.messages.listen((msg) => main.send({
+              't': 'msg',
+              'from': msg.from,
+              'port': msg.port,
+              'bytes': msg.payload,
+              'ms': msg.sent.millisecondsSinceEpoch,
+              'to': msg.to,
+            }));
         final rawPeers = (cfg['peers'] as List?)?.cast<Uint8List>();
-        final peers = rawPeers
+        var peers = rawPeers
             ?.map(parseRouterInfo)
             .whereType<RouterInfo>()
             .toList();
+        stateDir = cfg['stateDir'] as String?;
+        var good = <String>{};
+        final fromCache = peers == null && stateDir != null;
+        if (fromCache) {
+          final c = loadRouterCache(stateDir!);
+          peers = c.routers;
+          good = c.good;
+        }
+        final idBytes = cfg['identity'] as Uint8List?;
         final ok = await node!.start(
           peers: peers,
+          identity: idBytes == null ? null : I2pIdentity.fromBytes(idBytes),
+          cached: fromCache,
+          goodPeers: good,
           hostOverride: cfg['host'] as String?,
           portOverride: cfg['port'] as int?,
           ivOverride: cfg['iv'] as Uint8List?,
           hops: cfg['hops'] as int,
         );
+        if (ok) {
+          saveRouters();
+          saveTimer = Timer.periodic(const Duration(minutes: 30), (_) => saveRouters());
+        }
         main.send({'t': 'ready', 'b32': ok ? node!.b32 : null});
+        break;
+      case 'addShared':
+        final b32 = await node?.addSharedDestination(m['enc'] as Uint8List, m['sign'] as Uint8List);
+        main.send({'t': 'result', 'id': m['id'], 'data': b32});
+        break;
+      case 'removeShared':
+        node?.removeSharedDestination(m['hash'] as Uint8List);
+        main.send({'t': 'result', 'id': m['id'], 'data': null});
+        break;
+      case 'send':
+        final sent = await node?.sendMessage(
+                m['dest'] as Uint8List, m['port'] as int, m['bytes'] as Uint8List) ??
+            false;
+        main.send({'t': 'result', 'id': m['id'], 'data': sent});
         break;
       case 'getResp':
         final c = getReqs.remove(m['id']);
@@ -218,6 +310,8 @@ void _isolateMain(SendPort main) {
         main.send({'t': 'result', 'id': m['id'], 'data': null});
         break;
       case 'stop':
+        saveTimer?.cancel();
+        saveRouters();
         node?.close();
         break;
     }

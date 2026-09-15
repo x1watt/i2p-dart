@@ -133,6 +133,67 @@ DatResponse? parseDat(Uint8List payload) {
   return DatResponse(sha, payload.sublist(37, 37 + len));
 }
 
+// ---- application messages ----
+// APP 'A' | version | port u16 | msgId 8 | time u32 (seconds) | toHash 32
+//     | (version 2) reply leases: count u8, count x (gatewayHash 32, tunnelId u32)
+//     | payload
+// Inside a repliable datagram, so the sender's Ed25519 signature covers the
+// port, id, time, recipient and reply leases: a relay can't redirect it to
+// another destination, and the receiver drops old or repeated frames. The
+// reply leases let the receiver answer without looking the sender up in the
+// network database (as a GET does), which is what makes a first answer to
+// a newcomer work when the two nodes know different floodfills.
+
+const opApp = 0x41;
+const appHeaderLen = 1 + 1 + 2 + 8 + 4 + 32;
+
+/// Largest application payload [buildApp] accepts.
+const appMaxPayload = 32 * 1024;
+
+class AppFrame {
+  final int port;
+  final Uint8List msgId; // 8
+  final int timeSeconds;
+  final Uint8List toHash; // 32
+  final Uint8List payload;
+
+  /// Where the sender can be reached (its inbound gateways); empty in
+  /// version 1 frames.
+  final List<ReplyLease> replyLeases;
+  AppFrame(this.port, this.msgId, this.timeSeconds, this.toHash, this.payload, {this.replyLeases = const []});
+}
+
+Uint8List buildApp(AppFrame f) {
+  if (f.payload.length > appMaxPayload) throw ArgumentError('payload over $appMaxPayload bytes');
+  if (f.msgId.length != 8 || f.toHash.length != 32) throw ArgumentError('bad id or hash');
+  final v2 = f.replyLeases.isNotEmpty;
+  final b = BytesBuilder();
+  b.add([opApp, v2 ? 2 : 1, (f.port >> 8) & 0xff, f.port & 0xff]);
+  b.add(f.msgId);
+  final t = f.timeSeconds;
+  b.add([(t >> 24) & 0xff, (t >> 16) & 0xff, (t >> 8) & 0xff, t & 0xff]);
+  b.add(f.toHash);
+  if (v2) _putLeases(b, f.replyLeases.take(16).toList());
+  b.add(f.payload);
+  return b.toBytes();
+}
+
+AppFrame? parseApp(Uint8List p) {
+  if (p.length < appHeaderLen || p[0] != opApp || (p[1] != 1 && p[1] != 2)) return null;
+  final t = (p[12] << 24) | (p[13] << 16) | (p[14] << 8) | p[15];
+  var at = appHeaderLen;
+  var leases = const <ReplyLease>[];
+  if (p[1] == 2) {
+    if (p.length < at + 1) return null;
+    final n = p[at];
+    if (p.length < at + 1 + n * 36) return null;
+    leases = _getLeases(p, at);
+    at += 1 + n * 36;
+  }
+  return AppFrame((p[2] << 8) | p[3], p.sublist(4, 12), t, p.sublist(16, 48), p.sublist(at),
+      replyLeases: leases);
+}
+
 // ---- content-routing (provider DHT) payloads ----
 // PROVIDE  'P' + contentSha(32) + providerDestHash(32)
 // FINDPROV 'F' + contentSha(32) + replyGatewayHash(32) + replyTunnelId(4)

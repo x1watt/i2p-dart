@@ -110,10 +110,12 @@ class OurRouter {
   OurRouter._(this.staticPriv, this.staticPub, this.signPriv, this.signPub,
       this.identity, this.identityHash, this.routerInfo);
 
-  static Future<OurRouter> generate({int netId = 2}) async {
+  /// A new router identity, or the same one again from its two 32-byte seeds.
+  static Future<OurRouter> generate(
+      {int netId = 2, Uint8List? staticSeed, Uint8List? signSeed}) async {
     final rnd = Random.secure();
-    final s = await I2pCrypto.x25519Generate();
-    final sign = await I2pCrypto.ed25519Generate();
+    final s = await I2pCrypto.x25519Generate(staticSeed);
+    final sign = await I2pCrypto.ed25519Generate(signSeed);
 
     // ---- RouterIdentity ----
     final identityBytes = buildKeysAndCert(s.pub, sign.pub);

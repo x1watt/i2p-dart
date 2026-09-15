@@ -43,7 +43,12 @@ class RouterInfo {
   final Uint8List identity; // raw RouterIdentity bytes
   final List<I2pAddress> addresses;
   final Map<String, String> options;
-  RouterInfo(this.identityHash, this.identity, this.addresses, this.options);
+  /// The bytes this was parsed from (kept so the node can cache routers).
+  final Uint8List? raw;
+  /// When the router published this info (ms since epoch).
+  final int publishedMs;
+  RouterInfo(this.identityHash, this.identity, this.addresses, this.options,
+      {this.raw, this.publishedMs = 0});
 
   I2pAddress? get ntcp2 {
     for (final a in addresses) {
@@ -128,7 +133,10 @@ RouterInfo? parseRouterInfo(Uint8List data) {
     final identity = data.sublist(idStart, r.p);
     final identityHash = I2pCrypto.sha256(identity);
 
-    r.take(8); // published date
+    var published = 0;
+    for (final b in r.take(8)) {
+      published = published * 256 + b;
+    }
     final addrCount = r.u8();
     final addresses = <I2pAddress>[];
     for (var i = 0; i < addrCount; i++) {
@@ -141,7 +149,8 @@ RouterInfo? parseRouterInfo(Uint8List data) {
     r.u8(); // peer_size (unused, 0)
     final options = r.mapping();
     // signature follows (length depends on sig type) — not needed here.
-    return RouterInfo(identityHash, identity, addresses, options);
+    return RouterInfo(identityHash, identity, addresses, options,
+        raw: data, publishedMs: published);
   } catch (_) {
     return null;
   }

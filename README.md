@@ -16,6 +16,14 @@ project so it can be reused as a standalone library.
 - **netDB** — reseeds over HTTPS (multi-operator), looks up and publishes
   `LeaseSet2` records to the floodfill DHT.
 - **Repliable signed datagrams** — Ed25519-signed `GET`/`DAT` by sha256.
+- **Application messages**: send any bytes (up to 32 KiB) to a `.b32.i2p`
+  address on a port; each arrives at most once, signed by its sender's
+  destination, addressed to the receiver and fresh (replays are dropped).
+- **Lasting identity**: the same destination (address) and router across
+  starts from an `I2pIdentity`, and a cache of the routers seen, so a restart
+  skips the reseed download.
+- **Checked lease sets**: a looked-up `LeaseSet2` is used only when its
+  destination hashes to the address asked for and its signature is valid.
 - **Content discovery** — an IPFS-style provider DHT (`PROVIDE` / `FINDPROV`):
   find a blob by its sha256 *without* knowing which device holds it.
 - **Swarm** — a BitTorrent-style piece swarm so large files download collectively
@@ -49,10 +57,23 @@ class MyStore implements I2pContentStore {
   Future<void> put(Uint8List bytes, String ext) async { /* persist bytes */ }
 }
 
-final i2p = I2pService(store: MyStore(), log: print);
+// Keep the same address across runs: store identity.toBytes() somewhere safe
+// (it holds private keys) and pass I2pIdentity.fromBytes(...) next time.
+final identity = I2pIdentity.generate();
 
-await i2p.ensureStarted();          // reseed + build tunnels (idempotent)
-print('reachable at ${i2p.b32}.b32.i2p');
+final i2p = I2pService(
+  store: MyStore(),
+  log: print,
+  identity: identity,
+  stateDir: '/path/to/app/data/i2p', // router cache: later starts skip the reseed
+);
+
+await i2p.ensureStarted();          // reseed (or cache) + build tunnels (idempotent)
+print('reachable at ${i2p.b32}');   // "<52 chars>.b32.i2p"
+
+// Application messages: any bytes to an address, on a port.
+i2p.messages.listen((m) => print('${m.fromB32} port ${m.port}: ${m.payload.length} bytes'));
+await i2p.send('<52chars>.b32.i2p', 4242, payload);
 
 // Make a blob discoverable by its hash:
 await i2p.announce(sha256Bytes);
@@ -89,20 +110,26 @@ storage hook). For lower-level control the package also exports:
 - `I2pWorker` / `I2pWorkerConfig` — the isolate runner you can drive directly.
 - `I2pNode` — the node itself (transport, tunnels, datagrams, swarm), if you want
   to run it on your own isolate or embed it.
+- `I2pIdentity`: the destination and router seeds; `I2pMessage`: a received
+  application message.
 - `RouterInfo`, `parseRouterInfo`, `reseed`, `reseedRouters` — netDB helpers.
 
 ## Notes & limitations
 
 - **Network selection**: `I2pService(netId: 2)` is the live public net. Use an
   isolated `netId` to point at a private testnet (e.g. a local `i2pd`).
-- **Datagrams are signed but not yet encrypted** (garlic ECIES for payloads is
-  not implemented), so transit routers can read content. Add confidentiality
-  before relying on it for private data.
+- **Datagrams are signed but not encrypted** (garlic ECIES for payloads is not
+  implemented), so the two transit routers on a path (the sender's outbound
+  endpoint and the receiver's inbound gateway) can read them. Encrypt private
+  payloads end to end above this layer; minerfan, for one, sends XPRS packets
+  whose bodies are sealed to their recipient.
+- **Delivery is best effort**, like UDP: `send` returning true means a gateway
+  took the message, not that it arrived. Acknowledge at the application layer.
 - **2-hop inbound tunnels** are opt-in (`hops`) and not yet established on the
   live net; the default 1-hop path is the proven one. 1-hop forwarding is
   probabilistic, so the node leans on gateway diversity + retry + persistence.
 - **Mobile NAT**: phones behind carrier CGNAT may fail the data plane in some
-  conditions; see the Aurora project notes for the current state.
+  conditions.
 
 ## License
 

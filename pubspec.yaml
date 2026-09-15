@@ -2,7 +2,7 @@ name: i2p
 description: >-
   A pure-Dart I2P node: decentralized, NAT-traversing, content-addressed file
   sharing with no native binaries, no router install and no router config.
-version: 0.1.0
+version: 0.3.0
 repository: https://github.com/geograms/i2p-dart
 
 environment:

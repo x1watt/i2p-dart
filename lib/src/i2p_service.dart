@@ -16,6 +16,10 @@
 import 'dart:convert';
 import 'dart:typed_data';
 
+import 'i2p_identity.dart';
+import 'i2p_leaseset.dart';
+import 'i2p_node.dart' show i2pBase32;
+import 'i2p_message.dart';
 import 'i2p_worker.dart';
 
 /// Pluggable, content-addressed blob store the node serves from and stores into.
@@ -41,18 +45,38 @@ class I2pCallbackStore implements I2pContentStore {
   Future<void> put(Uint8List bytes, String ext) => onPut(bytes, ext);
 }
 
+/// The `.b32.i2p` address of the destination made from these two 32-byte
+/// seeds, without answering for it (see [I2pService.addSharedDestination]).
+Future<String> sharedDestinationAddress(Uint8List encSeed, Uint8List signSeed) async {
+  final d = await Destination.generate(encSeed: encSeed, signSeed: signSeed);
+  return '${i2pBase32(d.hash)}.b32.i2p';
+}
+
 class I2pService {
   /// [store] backs content serving/storage (optional: a fetch-only node can omit
   /// it, but it will not be able to serve content to peers). [log] receives
   /// human-readable status lines. [netId] selects the I2P network (2 = the live
   /// public net; use an isolated id for a private testnet).
+  ///
+  /// [identity] keeps the same address across starts: pass the same
+  /// [I2pIdentity] every time (keep its bytes secret; the service never
+  /// writes them). [stateDir] is where the node caches the routers it saw, so
+  /// the next start skips the reseed download.
   I2pService({
     I2pContentStore? store,
     void Function(String msg)? log,
     int netId = 2,
+    I2pIdentity? identity,
+    String? stateDir,
+    bool rxDiag = false,
+    bool directDelivery = true,
   })  : _store = store,
+        _rxDiag = rxDiag,
+        _direct = directDelivery,
         _log = log ?? ((_) {}),
-        _netId = netId {
+        _netId = netId,
+        _identity = identity,
+        _stateDir = stateDir {
     _worker = I2pWorker(
       log: (m) => _log('I2P: $m'),
       onGet: _serve,
@@ -62,6 +86,10 @@ class I2pService {
   final I2pContentStore? _store;
   final void Function(String msg) _log;
   final int _netId;
+  final I2pIdentity? _identity;
+  final String? _stateDir;
+  final bool _rxDiag;
+  final bool _direct;
 
   late final I2pWorker _worker;
   bool _started = false;
@@ -74,9 +102,12 @@ class I2pService {
   bool get isStarting => _starting;
   bool get isPaused => _paused;
 
-  /// Our destination's base32 address ("<52chars>.b32.i2p" without the suffix),
-  /// available once the node is up. Share this so peers can reach us.
+  /// Our destination's address, "<52 chars>.b32.i2p", available once the node
+  /// is up. Share this so peers can reach us.
   String? get b32 => _b32;
+
+  /// Application messages sent to our destination (see [send]).
+  Stream<I2pMessage> get messages => _worker.messages;
 
   /// Start the node (in its isolate) once (idempotent). Returns true when up.
   Future<bool> ensureStarted() async {
@@ -84,7 +115,8 @@ class I2pService {
     if (_starting) return false;
     _starting = true;
     try {
-      _b32 = await _worker.start(I2pWorkerConfig(netId: _netId));
+      _b32 = await _worker.start(I2pWorkerConfig(
+          netId: _netId, identity: _identity?.toBytes(), stateDir: _stateDir, rxDiag: _rxDiag, directDelivery: _direct));
       _started = _b32 != null;
       _log(_started
           ? 'node up (isolate), b32=$_b32'
@@ -185,6 +217,30 @@ class I2pService {
   /// Announce that we provide [sha256] so other devices can find it by hash.
   Future<void> announce(Uint8List sha256) async {
     if (isUp) await _worker.announce(sha256);
+  }
+
+  /// Send [payload] (up to 32 KiB) to the destination [b32] on [port]. Best
+  /// effort, like a UDP datagram: true when one of its gateways took it; the
+  /// receiver gets each message at most once, signed by our destination.
+  Future<bool> send(String b32, int port, Uint8List payload) async {
+    final dest = decodeB32(b32);
+    if (!isUp || dest == null) return false;
+    return _worker.send(dest, port, payload);
+  }
+
+  /// Answer for a destination whose seeds other nodes hold too, such as one
+  /// derived from a chat room's name: the node publishes its LeaseSet2 with
+  /// our tunnels, and [messages] addressed to it arrive with `to` set.
+  /// Returns its address, or null while the node is down (add it again
+  /// after a restart).
+  Future<String?> addSharedDestination(Uint8List encSeed, Uint8List signSeed) async {
+    if (!isUp) return null;
+    return _worker.addShared(encSeed, signSeed);
+  }
+
+  Future<void> removeSharedDestination(String b32) async {
+    final h = decodeB32(b32);
+    if (isUp && h != null) await _worker.removeShared(h);
   }
 
   Future<bool> _persist(
