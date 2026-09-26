@@ -70,6 +70,39 @@ Uint8List? i2pBase32Decode(String addr) {
   return out.length < 32 ? null : Uint8List.fromList(out.sublist(0, 32));
 }
 
+/// When inbound gateways are replaced and how long their leases last. Pure,
+/// so the rules are tested without a network.
+class GatewayClock {
+  /// Routers drop a tunnel this long after it was built, while the session
+  /// to them stays up.
+  static const tunnelLifetime = Duration(minutes: 10);
+
+  /// A gateway older than this is replaced. The check runs with the
+  /// keepalive, every four minutes, so a gateway is rotated at an age between
+  /// 5.5 and 9.5 minutes, never after its tunnel expired.
+  static const maxAge = Duration(minutes: 5, seconds: 30);
+
+  /// A lease is published as ending this long before its tunnel does, so
+  /// senders stop using it in time.
+  static const leaseMargin = Duration(seconds: 30);
+
+  static bool aging(DateTime built, DateTime now) => now.difference(built) > maxAge;
+
+  /// The end (Unix seconds) of a lease published at [now] through a tunnel
+  /// built at [built]: ten minutes from now at most, and never after the
+  /// tunnel ends.
+  static int leaseEnd(DateTime built, DateTime now) {
+    int sec(DateTime t) => t.millisecondsSinceEpoch ~/ 1000;
+    return min(sec(now.add(tunnelLifetime)), sec(built.add(tunnelLifetime).subtract(leaseMargin)));
+  }
+
+  /// How many of [aging] gateways to retire when [total] are up and [want]
+  /// are wanted: only those that have replacements, so a node that could
+  /// not build new tunnels keeps the old ones rather than go dark.
+  static int retireCount({required int total, required int want, required int aging}) =>
+      (total - want).clamp(0, aging);
+}
+
 /// One inbound tunnel through a gateway router: its session (also used for
 /// serving), the tunnel id the gateway receives on, and the layer keys to
 /// decrypt tunnel data the gateway forwards to us.
@@ -84,6 +117,11 @@ class _Gw {
   final RouterInfo? leaseGw; // lease gateway router (hop1)
   final int? leaseTun; // lease tunnel id (hop1's receive tunnel)
   bool dead = false; // set when its serve loop / session fails
+
+  /// When the tunnel was built: routers drop a tunnel ten minutes after it,
+  /// while the session to them stays up, so age (not a failed session) is
+  /// what retires a gateway.
+  final DateTime built = DateTime.now();
   _Gw(this.session, this.ri, this.tunnelId, this.layer,
       {this.extraLayers, this.leaseGw, this.leaseTun});
 
@@ -484,7 +522,13 @@ class I2pNode {
       try {
         await _guard('publish', _publish, const Duration(seconds: 40));
         if (!_running) return;
+        final before = _gws.toSet();
         await _guard('rotateGateways', _rotateGateways, const Duration(seconds: 50));
+        // New gateways are reachable only once published: do it now, not at
+        // the next cycle four minutes later.
+        if (_running && !_gws.toSet().containsAll(before)) {
+          await _guard('publish', _publish, const Duration(seconds: 40));
+        }
         if (!_running) return;
         await _guard('ensureOutbound', _ensureOutbound, const Duration(seconds: 40));
         final mine = <Uint8List>[];
@@ -545,7 +589,13 @@ class I2pNode {
   /// Gateway health/rotation: drop dead gateways and rebuild through fresh
   /// routers to keep the target count, so a node recovers from flaky/expired
   /// tunnels without going dark.
+  /// Gateways are replaced before their tunnels' ten minutes run out
+  /// ([GatewayClock]).
   Future<void> _rotateGateways() async {
+    // Tunnels near the end of their life: build their replacements first,
+    // then retire them, so the node stays reachable throughout.
+    final now = DateTime.now();
+    final aging = _gws.where((g) => !g.dead && GatewayClock.aging(g.built, now)).toSet();
     final dead = _gws.where((g) => g.dead).toList();
     for (final g in dead) {
       _demoted.add(_hex(g.ri.identityHash));
@@ -555,11 +605,12 @@ class I2pNode {
     if (dead.isNotEmpty) {
       log?.call('node: dropped ${dead.length} dead gateway(s)');
     }
-    if (_gws.length >= _wantGateways) return;
+    int fresh() => _gws.where((g) => !aging.contains(g)).length;
+    if (fresh() >= _wantGateways) return;
     final inUse = _gws.map((g) => _hex(g.ri.identityHash)).toSet();
     final deadline = DateTime.now().add(const Duration(seconds: 40));
     for (final ri in _gatewayCandidates()) {
-      if (_gws.length >= _wantGateways || !_running) break;
+      if (fresh() >= _wantGateways || !_running) break;
       if (DateTime.now().isAfter(deadline)) break; // self-limit flaky dials
       if (inUse.contains(_hex(ri.identityHash))) continue;
       try {
@@ -576,6 +627,17 @@ class I2pNode {
         _demoted.add(_hex(ri.identityHash));
       }
     }
+    // Retire the aging gateways that have replacements; keep any we could
+    // not replace until the next cycle rather than go dark.
+    final retire = aging
+        .take(GatewayClock.retireCount(total: _gws.length, want: _wantGateways, aging: aging.length))
+        .toList();
+    for (final g in retire) {
+      g.dead = true;
+      _gws.remove(g);
+      g.session.close();
+    }
+    if (retire.isNotEmpty) log?.call('node: retired ${retire.length} aging gateway(s)');
   }
 
   /// Dial a router. The stable gateway/receiving session uses our real identity;
@@ -829,9 +891,10 @@ class I2pNode {
   /// closest floodfills.
   Future<void> _storeLeaseSet(Destination d, int n,
       {String label = 'LeaseSet2', List<Lease2> others = const []}) async {
-    final end = DateTime.now().millisecondsSinceEpoch ~/ 1000 + 600;
+    final now = DateTime.now();
     final leases = [
-      for (final g in _gws) Lease2(g.gateway.identityHash, g.gatewayTunnel, end)
+      for (final g in _gws)
+        Lease2(g.gateway.identityHash, g.gatewayTunnel, GatewayClock.leaseEnd(g.built, now))
     ];
     if (leases.isEmpty) return;
     for (final l in leases) {
