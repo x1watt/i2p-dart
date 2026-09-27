@@ -115,6 +115,8 @@ class I2pWorker {
         log?.call(m['msg'] as String);
         break;
       case 'msg':
+        // A message can still be on its way from the isolate after stop().
+        if (_messages.isClosed) break;
         _messages.add(I2pMessage(m['from'] as Uint8List, m['port'] as int,
             m['bytes'] as Uint8List, DateTime.fromMillisecondsSinceEpoch(m['ms'] as int),
             to: m['to'] as Uint8List?));
