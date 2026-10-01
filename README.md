@@ -75,6 +75,10 @@ print('reachable at ${i2p.b32}');   // "<52 chars>.b32.i2p"
 i2p.messages.listen((m) => print('${m.fromB32} port ${m.port}: ${m.payload.length} bytes'));
 await i2p.send('<52chars>.b32.i2p', 4242, payload);
 
+// One address per account on the same node: answer for it, then send from it.
+final alice = await i2p.addSharedDestination(aliceEncSeed, aliceSignSeed);
+await i2p.send('<52chars>.b32.i2p', 4242, payload, fromB32: alice);
+
 // Make a blob discoverable by its hash:
 await i2p.announce(sha256Bytes);
 
@@ -128,6 +132,8 @@ storage hook). For lower-level control the package also exports:
 - **2-hop inbound tunnels** are opt-in (`hops`) and not yet established on the
   live net; the default 1-hop path is the proven one. 1-hop forwarding is
   probabilistic, so the node leans on gateway diversity + retry + persistence.
+- **Several addresses on one node** share its tunnels: their lease sets list
+  the same gateways, so an observer can tell they live on one node.
 - **Mobile NAT**: phones behind carrier CGNAT may fail the data plane in some
   conditions.
 

@@ -222,10 +222,21 @@ class I2pService {
   /// Send [payload] (up to 32 KiB) to the destination [b32] on [port]. Best
   /// effort, like a UDP datagram: true when one of its gateways took it; the
   /// receiver gets each message at most once, signed by our destination.
-  Future<bool> send(String b32, int port, Uint8List payload) async {
+  ///
+  /// [fromB32] sends it from one of our shared destinations instead (see
+  /// [addSharedDestination]): it is signed by that destination, and the
+  /// receiver sees that address as the sender and replies to it. Use one
+  /// shared destination per account to keep accounts on one node apart.
+  /// Returns false if the node does not answer for [fromB32].
+  Future<bool> send(String b32, int port, Uint8List payload, {String? fromB32}) async {
     final dest = decodeB32(b32);
     if (!isUp || dest == null) return false;
-    return _worker.send(dest, port, payload);
+    Uint8List? from;
+    if (fromB32 != null) {
+      from = decodeB32(fromB32);
+      if (from == null) return false;
+    }
+    return _worker.send(dest, port, payload, fromHash: from);
   }
 
   /// Answer for a destination whose seeds other nodes hold too, such as one

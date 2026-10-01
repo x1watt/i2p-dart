@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+- Send from a chosen destination: `I2pService.send(b32, port, payload,
+  fromB32: ...)` (and `I2pNode.sendMessage(..., fromHash: ...)`) signs the
+  message with one of the node's shared destinations instead of its own, so
+  the receiver sees that address as the sender and replies to it. An app can
+  keep one address per account on a single node. Sending from a destination
+  the node does not answer for is refused (returns false). `pickSender`
+  chooses the signing destination and is covered by tests.
+- Limitation: every destination on a node publishes the same inbound
+  tunnels and embeds the same reply leases, so an observer comparing lease
+  sets can tell that two addresses live on one node. Separate tunnel pools
+  per destination would remove that link.
+
 ## 0.3.0
 
 - Shared destinations: `I2pService.addSharedDestination(encSeed, signSeed)`

@@ -36,6 +36,26 @@ Future<Uint8List> buildDatagram(Destination src, Uint8List payload) async {
   return b.toBytes();
 }
 
+/// The destination an outgoing message is signed with: [main] when [from] is
+/// null or names it, the one of [shared] that [from] names, or null when the
+/// node does not answer for [from] (the caller must then refuse to send).
+Destination? pickSender(Destination main, Iterable<Destination> shared, Uint8List? from) {
+  if (from == null) return main;
+  bool same(Uint8List a, Uint8List b) {
+    if (a.length != b.length) return false;
+    for (var i = 0; i < a.length; i++) {
+      if (a[i] != b[i]) return false;
+    }
+    return true;
+  }
+
+  if (same(main.hash, from)) return main;
+  for (final d in shared) {
+    if (same(d.hash, from)) return d;
+  }
+  return null;
+}
+
 class ParsedDatagram {
   final Uint8List srcDest; // KeysAndCert (391)
   final Uint8List srcHash; // SHA-256(srcDest) = destination hash

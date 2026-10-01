@@ -1550,8 +1550,20 @@ class I2pNode {
   /// [destHash] on [port]. Best effort, like a UDP datagram: true when at
   /// least one of its gateways took it. The frame goes to every gateway of
   /// the destination over two paths; the receiver keeps one copy.
-  Future<bool> sendMessage(Uint8List destHash, int port, Uint8List payload) async {
+  ///
+  /// [fromHash] picks the sending destination: null for the node's own, or
+  /// one added with [addSharedDestination], so an app can keep one address
+  /// per account and the receiver sees (and replies to) that address.
+  /// Returns false when the node does not answer for [fromHash].
+  Future<bool> sendMessage(Uint8List destHash, int port, Uint8List payload,
+      {Uint8List? fromHash}) async {
     if (!isUp) return false;
+    final sender = pickSender(dest, _shared.values, fromHash);
+    if (sender == null) {
+      log?.call('node: app send refused, not our destination: '
+          '${i2pBase32(fromHash!).substring(0, 8)}');
+      return false;
+    }
     final frame = buildApp(AppFrame(
         port & 0xffff,
         Uint8List.fromList(List.generate(8, (_) => _rng.nextInt(256))),
@@ -1563,7 +1575,7 @@ class I2pNode {
     // look it up afresh rather than trust a cached set.
     if (_shared.containsKey(_hex(destHash))) _leaseCache.remove(_hex(destHash));
     final cached = _leaseCache[_hex(destHash)]?.$1.length;
-    final ok = await _sendToCachedDest(destHash, await buildDatagram(dest, frame));
+    final ok = await _sendToCachedDest(destHash, await buildDatagram(sender, frame));
     log?.call('node: app send port $port to ${i2pBase32(destHash).substring(0, 8)} '
         '(${payload.length}b, ${cached == null ? 'looked up' : '$cached cached lease(s)'}): ${ok ? 'handed to a gateway' : 'failed'}');
     return ok;

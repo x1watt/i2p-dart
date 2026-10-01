@@ -170,8 +170,12 @@ class I2pWorker {
   Future<void> removeShared(Uint8List hash) => _call('removeShared', {'hash': hash});
 
   /// Send an application message; true when a gateway of [destHash] took it.
-  Future<bool> send(Uint8List destHash, int port, Uint8List payload) async =>
-      await _call('send', {'dest': destHash, 'port': port, 'bytes': payload}) as bool? ?? false;
+  /// [fromHash] signs it as one of our shared destinations instead of the
+  /// node's own (see [I2pNode.sendMessage]).
+  Future<bool> send(Uint8List destHash, int port, Uint8List payload, {Uint8List? fromHash}) async =>
+      await _call('send', {'dest': destHash, 'port': port, 'bytes': payload, 'from': fromHash})
+          as bool? ??
+      false;
   Future<void> setRoster(List<Uint8List> hashes) =>
       _call('setRoster', {'roster': hashes});
   Future<void> pause() => _call('pause');
@@ -274,7 +278,8 @@ void _isolateMain(SendPort main) {
         break;
       case 'send':
         final sent = await node?.sendMessage(
-                m['dest'] as Uint8List, m['port'] as int, m['bytes'] as Uint8List) ??
+                m['dest'] as Uint8List, m['port'] as int, m['bytes'] as Uint8List,
+                fromHash: m['from'] as Uint8List?) ??
             false;
         main.send({'t': 'result', 'id': m['id'], 'data': sent});
         break;

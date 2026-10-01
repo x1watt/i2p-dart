@@ -162,6 +162,32 @@ void main() {
     });
   });
 
+  group('sending from a chosen destination', () {
+    test('picks the node\'s own, a shared one, or refuses an unknown one', () async {
+      final main = await Destination.generate();
+      final alice = await Destination.generate(encSeed: bytes(32, 31), signSeed: bytes(32, 32));
+      final bob = await Destination.generate(encSeed: bytes(32, 41), signSeed: bytes(32, 42));
+      final stranger = await Destination.generate();
+      expect(pickSender(main, [alice, bob], null), same(main));
+      expect(pickSender(main, [alice, bob], main.hash), same(main));
+      expect(pickSender(main, [alice, bob], bob.hash), same(bob));
+      expect(pickSender(main, [alice, bob], stranger.hash), isNull);
+      expect(pickSender(main, const [], alice.hash), isNull);
+    });
+
+    test('a message signed by a shared destination arrives from that address', () async {
+      final main = await Destination.generate();
+      final alice = await Destination.generate(encSeed: bytes(32, 31), signSeed: bytes(32, 32));
+      final payload = Uint8List.fromList([1, 2, 3]);
+      final dg = await buildDatagram(pickSender(main, [alice], alice.hash)!, payload);
+      final parsed = await parseDatagram(dg);
+      expect(parsed, isNotNull);
+      expect(parsed!.srcHash, alice.hash);
+      expect(parsed.srcHash, isNot(main.hash));
+      expect(parsed.payload, payload);
+    });
+  });
+
   group('router cache', () {
     test('keeps routers, their order and the worked flag', () async {
       final a = await OurRouter.generate(), b = await OurRouter.generate();
